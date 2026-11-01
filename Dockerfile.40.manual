@@ -38,11 +38,19 @@ SHELL ["/bin/bash", "-c"]
 # ------------------------------------------------------------
 # Provisioning: Install Java/Maven via SDKMAN
 # ------------------------------------------------------------
-RUN curl -s "https://get.sdkman.io" | bash && \
+RUN for attempt in 1 2 3; do \
+        echo ">> SDKMAN bootstrap: attempt ${attempt}/3" && \
+        if curl -fsSL --connect-timeout 15 --max-time 120 -o /tmp/sdkman-install.sh "https://get.sdkman.io" && bash /tmp/sdkman-install.sh; then \
+            break; \
+        fi; \
+        echo ">> attempt ${attempt} failed; removing partial SDKMAN before retry" && \
+        rm -rf "$SDKMAN_DIR"; \
+    done && \
+    [ -x "$SDKMAN_DIR/bin/sdk" ] || { echo "ERROR: SDKMAN bootstrap failed after 3 attempts" >&2; exit 1; } && \
     source "$SDKMAN_DIR/bin/sdkman-init.sh" && \
     sdk install java "$JAVA_VERSION" && \
     sdk install maven "$MAVEN_VERSION" && \
-    rm -rf "$SDKMAN_DIR/archives/*" "$SDKMAN_DIR/tmp/*"
+    rm -rf /tmp/sdkman-install.sh "$SDKMAN_DIR/archives/*" "$SDKMAN_DIR/tmp/*"
 
 WORKDIR /app
 
