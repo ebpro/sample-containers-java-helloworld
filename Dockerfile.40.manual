@@ -1,21 +1,24 @@
 # ============================================================
-# Stage 1: Build Environment (Manual SDKMAN Toolchain)
-# Purpose: Demonstrate manual environment provisioning and
-#          fixed-UID/GID file ownership for high-security CI.
+# Stage 1: Build Environment (Manual Toolchain)
+# Purpose: Demonstrate manual, reproducible toolchain provisioning:
+#          the JDK is pinned by the base image tag and Maven by a
+#          pinned Apache release tarball — combined with fixed
+#          UID/GID file ownership for high-security CI.
 # ============================================================
-FROM ubuntu:noble AS stage-build
+FROM eclipse-temurin:25-jdk-noble AS stage-build
 
 # Toolchain versioning for reproducible builds
-ARG JAVA_VERSION="25.0.3-tem"
+# (the JDK itself is pinned by the eclipse-temurin base image tag)
 ARG MAVEN_VERSION="3.9.16"
 ARG BUILDER_UID=2000
 ARG BUILDER_GID=2000
 
 LABEL maintainer="Emmanuel Bruno <emmanuel.bruno@univ-tln.fr>"
-LABEL description="Java Hello World Application - SDKMAN build"
+LABEL description="Java Hello World Application - manual toolchain build"
 
 # ------------------------------------------------------------
-# OS Layer: Provision essential tools for SDKMAN
+# OS Layer: Provision tools to fetch and verify the pinned
+#           Apache Maven release (and to run the Maven wrapper).
 # ------------------------------------------------------------
 RUN apt-get update && \
     apt-get install --yes --quiet --no-install-recommends \
@@ -28,29 +31,33 @@ RUN apt-get update && \
 RUN groupadd -g ${BUILDER_GID} builder \
     && useradd -m -u ${BUILDER_UID} -g builder -s /bin/bash builder
 
-USER builder
-ENV HOME=/home/builder
-ENV SDKMAN_DIR="$HOME/.sdkman"
-ENV PATH="$SDKMAN_DIR/bin:$SDKMAN_DIR/candidates/java/current/bin:$SDKMAN_DIR/candidates/maven/current/bin:$PATH"
-
-SHELL ["/bin/bash", "-c"]
-
 # ------------------------------------------------------------
-# Provisioning: Install Java/Maven via SDKMAN
+# Toolchain: Install a pinned Apache Maven release from the
+#           official archive into a fixed prefix. Bounded 3-attempt
+#           retry; fails loud if the tarball is missing or broken.
+#           Runs as root so /opt/maven stays readable by the
+#           unprivileged builder user.
 # ------------------------------------------------------------
-RUN for attempt in 1 2 3; do \
-        echo ">> SDKMAN bootstrap: attempt ${attempt}/3" && \
-        if curl -fsSL --connect-timeout 15 --max-time 120 -o /tmp/sdkman-install.sh "https://get.sdkman.io" && bash /tmp/sdkman-install.sh; then \
+RUN MAVEN_HOME=/opt/maven; \
+    MAVEN_TGZ="https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"; \
+    for attempt in 1 2 3; do \
+        echo ">> Apache Maven ${MAVEN_VERSION}: attempt ${attempt}/3" && \
+        if curl -fsSL --connect-timeout 15 --max-time 300 -o /tmp/apache-maven.tar.gz "$MAVEN_TGZ" && \
+           tar -xzf /tmp/apache-maven.tar.gz -C /opt && \
+           mv /opt/apache-maven-${MAVEN_VERSION} "$MAVEN_HOME" && \
+           "$MAVEN_HOME/bin/mvn" -version; then \
             break; \
         fi; \
-        echo ">> attempt ${attempt} failed; removing partial SDKMAN before retry" && \
-        rm -rf "$SDKMAN_DIR"; \
+        echo ">> attempt ${attempt} failed; removing partial Maven install before retry" && \
+        rm -rf /tmp/apache-maven.tar.gz "$MAVEN_HOME"; \
     done && \
-    [ -x "$SDKMAN_DIR/bin/sdk" ] || { echo "ERROR: SDKMAN bootstrap failed after 3 attempts" >&2; exit 1; } && \
-    source "$SDKMAN_DIR/bin/sdkman-init.sh" && \
-    sdk install java "$JAVA_VERSION" && \
-    sdk install maven "$MAVEN_VERSION" && \
-    rm -rf /tmp/sdkman-install.sh "$SDKMAN_DIR/archives/*" "$SDKMAN_DIR/tmp/*"
+    [ -x "$MAVEN_HOME/bin/mvn" ] || { echo "ERROR: Apache Maven ${MAVEN_VERSION} install failed after 3 attempts" >&2; exit 1; }
+
+USER builder
+ENV HOME=/home/builder
+ENV PATH="/opt/maven/bin:${PATH}"
+
+SHELL ["/bin/bash", "-c"]
 
 WORKDIR /app
 
@@ -62,7 +69,6 @@ COPY --chown=builder:builder .mvn .mvn
 COPY --chown=builder:builder pom.xml ./
 
 RUN --mount=type=cache,target=/home/builder/.m2,uid=${BUILDER_UID},gid=${BUILDER_GID} \
-    source "$SDKMAN_DIR/bin/sdkman-init.sh" && \
     ./mvnw --batch-mode dependency:resolve
 
 # ------------------------------------------------------------
@@ -71,7 +77,6 @@ RUN --mount=type=cache,target=/home/builder/.m2,uid=${BUILDER_UID},gid=${BUILDER
 COPY --chown=builder:builder src ./src
 
 RUN --mount=type=cache,target=/home/builder/.m2,uid=${BUILDER_UID},gid=${BUILDER_GID} \
-    source "$SDKMAN_DIR/bin/sdkman-init.sh" && \
     ./mvnw --batch-mode -Pjvm -DskipTests clean verify
 
 # ============================================================
